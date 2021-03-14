@@ -1,17 +1,18 @@
 package main
 
 import (
-	"fmt"
+	"bytes"
+	"encoding/json"
+	"github.com/davecgh/go-spew/spew"
 )
 
 func main() {
-	cond := map[string]interface{}{
-		"_limit": []uint{0, 15},
-	}
-	limit := cond["_limit"]
-	delete(cond, "_limit")
-	fmt.Printf("%v\n", cond)
+	var num int
+	bufferString := bytes.NewBufferString("8")
 
-	cond["_limit"] = limit
-	fmt.Printf("%v\n", cond)
+	err := json.Unmarshal(bufferString.Bytes(), &num)
+	if err!=nil {
+		panic(err)
+	}
+	spew.Dump(num)
 }

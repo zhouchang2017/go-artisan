@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"go-artisan/pkg/sqlx"
 
 	"github.com/didi/gendry/builder"
@@ -15,42 +16,36 @@ func init() {
 }
 
 var (
-	DefaultPerPage    uint = 15
-	DefaultPrimaryKey      = "id"
+	defaultPerPage uint = 15
 )
 
 type (
-
-	// Init Model Options
-	ModelOption func(*modelTx)
-
-	ModelTX interface {
-		sqlx.Session
-		Find(ctx context.Context, entity interface{}, conditions map[string]interface{}, fields ...string) error
-		Insert(ctx context.Context, data map[string]interface{}) (res sql.Result, err error)
-		Inserts(ctx context.Context, data []map[string]interface{}) (res sql.Result, err error)
-		Count(ctx context.Context, conditions map[string]interface{}) (count int64, err error)
-		Delete(ctx context.Context, conditions map[string]interface{}) (res sql.Result, err error)
-		Update(ctx context.Context, val map[string]interface{}, conditions map[string]interface{}) (res sql.Result, err error)
-		Pagination(ctx context.Context, page int64, entity interface{}, conditions map[string]interface{}) (paginator *Paginator, err error)
-		Table() string
+	session interface {
+		ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+		QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 	}
 
-	Model interface {
-		ModelTX
-		TX(tx sqlx.Session) ModelTX
+	queryCall func(db session, table string) error
+	execCall  func(db session, table string) (res sql.Result, err error)
+	countCall func(db session, table string) (res int64, err error)
+
+	core struct {
+		db      session
+		table   string
+		perPage uint
 	}
 
 	modelTx struct {
-		sqlx.Session
-		tableName string
-		perPage   uint // 分页步长
+		db *sql.Tx
+		*core
 	}
 
-	model struct {
-		db sqlx.SqlConn
-		*modelTx
+	Model struct {
+		db *sql.DB
+		*core
 	}
+
+	Option func(m *Model)
 
 	Paginator struct {
 		Total       int64 `json:"total"`         // 总计条数
@@ -61,143 +56,170 @@ type (
 	}
 )
 
-func SetPerPage(perPage uint) ModelOption {
-	return func(tx *modelTx) {
-		tx.perPage = perPage
+// 设置分页步长
+func SetPerPage(perPage uint) Option {
+	return func(m *Model) {
+		m.perPage = perPage
 	}
 }
 
-func NewModel(db sqlx.SqlConn, tableName string, opts ...ModelOption) Model {
-	m := &model{
+// NewModel
+func New(db *sql.DB, table string, opts ...Option) *Model {
+	m := &Model{
 		db: db,
-		modelTx: &modelTx{
-			Session:   db,
-			tableName: tableName,
-			perPage:   DefaultPerPage,
+		core: &core{
+			db:      db,
+			table:   table,
+			perPage: defaultPerPage,
 		},
 	}
 	for _, opt := range opts {
-		opt(m.modelTx)
+		opt(m)
 	}
 	return m
 }
 
-func (m model) TX(tx sqlx.Session) ModelTX {
+// 实例化事务对象
+func (m Model) TX(tx *sql.Tx) *modelTx {
 	return &modelTx{
-		Session:   tx,
-		tableName: m.tableName,
-		perPage:   m.perPage,
+		db: tx,
+		core: &core{
+			db:      tx,
+			table:   m.table,
+			perPage: m.perPage,
+		},
 	}
 }
 
-func (m modelTx) Find(ctx context.Context, entity interface{}, conditions map[string]interface{}, fields ...string) error {
-	cond, vals, err := builder.BuildSelect(m.tableName, conditions, fields)
+// return database handle
+func (m Model) DB() *sql.DB {
+	return m.db
+}
+
+// return database handle
+func (m modelTx) DB() *sql.Tx {
+	return m.db
+}
+
+// Find
+func (c *core) Find(ctx context.Context, entity interface{}, conditions map[string]interface{}, fields ...string) error {
+	cond, vals, err := builder.BuildSelect(c.table, conditions, fields)
 	if err != nil {
 		return err
 	}
 
-	rows, err := m.Session.QueryContext(ctx, cond, vals...)
+	rows, err := c.db.QueryContext(ctx, cond, vals...)
 	if err != nil {
 		return err
 	}
 	return scanner.ScanClose(rows, entity)
 }
 
-func (m modelTx) Insert(ctx context.Context, data map[string]interface{}) (res sql.Result, err error) {
-	return m.Inserts(ctx, []map[string]interface{}{data})
+// Insert
+func (c *core) Insert(ctx context.Context, data map[string]interface{}) (res sql.Result, err error) {
+	return c.Inserts(ctx, data)
 }
 
-func (m modelTx) Inserts(ctx context.Context, data []map[string]interface{}) (res sql.Result, err error) {
-	cond, vals, err := builder.BuildInsert(m.tableName, data)
+// Inserts
+func (c *core) Inserts(ctx context.Context, data ...map[string]interface{}) (res sql.Result, err error) {
+	if len(data) == 0 {
+		return nil, errors.New("insert data is empty")
+	}
+	cond, vals, err := builder.BuildInsert(c.table, data)
 	if err != nil {
 		return nil, err
 	}
-
-	return m.Session.ExecContext(ctx, cond, vals...)
+	return c.db.ExecContext(ctx, cond, vals...)
 }
 
-func (m modelTx) Count(ctx context.Context, conditions map[string]interface{}) (count int64, err error) {
-	cond, vals, err := builder.BuildSelect(m.tableName, conditions, []string{"count(*)"})
+// Count
+func (c *core) Count(ctx context.Context, conditions map[string]interface{}) (res int64, err error) {
+	cond, vals, err := builder.BuildSelect(c.table, conditions, []string{"count(*)"})
 	if err != nil {
-		return count, err
+		return res, err
 	}
 
-	rows, err := m.Session.QueryContext(ctx, cond, vals...)
+	rows, err := c.db.QueryContext(ctx, cond, vals...)
 	if err != nil {
 		return 0, err
 	}
 	defer rows.Close()
 
-	count = 0
+	res = 0
 	if rows.Next() {
-		err = rows.Scan(&count)
+		err = rows.Scan(&res)
 		if err != nil {
 			return 0, err
 		}
 	}
-	return count, nil
+	return res, nil
 }
 
-func (m modelTx) Delete(ctx context.Context, conditions map[string]interface{}) (res sql.Result, err error) {
-	cond, vals, err := builder.BuildDelete(m.tableName, conditions)
+// Delete
+func (c *core) Delete(ctx context.Context, conditions map[string]interface{}) (res sql.Result, err error) {
+	cond, vals, err := builder.BuildDelete(c.table, conditions)
 	if err != nil {
 		return nil, err
 	}
-
-	return m.Session.ExecContext(ctx, cond, vals...)
+	return c.db.ExecContext(ctx, cond, vals...)
 }
 
-func (m modelTx) Update(ctx context.Context, val map[string]interface{}, conditions map[string]interface{}) (res sql.Result, err error) {
-	cond, vals, err := builder.BuildUpdate(m.tableName, conditions, val)
+// Update
+func (c *core) Update(ctx context.Context, val map[string]interface{}, conditions map[string]interface{}) (res sql.Result, err error) {
+	cond, vals, err := builder.BuildUpdate(c.table, conditions, val)
 	if err != nil {
 		return nil, err
 	}
-
-	return m.Session.ExecContext(ctx, cond, vals...)
+	return c.db.ExecContext(ctx, cond, vals...)
 }
 
-func (m modelTx) Pagination(ctx context.Context, page int64, entity interface{}, conditions map[string]interface{}) (paginator *Paginator, err error) {
+// Pagination 分页
+func (c *core) Pagination(ctx context.Context, page int64, perPage uint, entity interface{}, conditions map[string]interface{}) (paginator *Paginator, err error) {
 	if conditions == nil {
 		conditions = make(map[string]interface{})
 	}
 	// expect _limit
-	take := m.perPage
+
+	if perPage == 0 {
+		perPage = c.perPage
+	}
+
 	if hasLimit, ok := conditions["_limit"]; ok {
 		if isLimit, ok := hasLimit.([]uint); ok {
 			if len(isLimit) == 2 && isLimit[1] > 0 {
-				take = isLimit[1]
+				perPage = isLimit[1]
 			}
 		}
 	}
 	delete(conditions, "_limit")
 
-	count, err := m.Count(ctx, conditions)
+	count, err := c.Count(ctx, conditions)
 	if err != nil {
 		return nil, err
 	}
 
 	defer func() {
-		paginator = newPaginator(count, page, take)
+		paginator = newPaginator(count, page, perPage)
 	}()
 
-	offset := (page - 1) * int64(take)
+	offset := (page - 1) * int64(perPage)
 
 	if offset >= count {
 		// 没结果
 		return
 	}
 
-	conditions["_limit"] = []uint{uint(offset), take}
+	conditions["_limit"] = []uint{uint(offset), perPage}
 
-	err = m.Find(ctx, entity, conditions)
+	err = c.Find(ctx, entity, conditions)
 	if err != nil {
 		return nil, err
 	}
 	return
 }
 
-func (m modelTx) Table() string {
-	return m.tableName
+func (c *core) Table() string {
+	return c.table
 }
 
 func newPaginator(count int64, page int64, perPage uint) *Paginator {

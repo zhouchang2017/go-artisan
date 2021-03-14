@@ -30,8 +30,8 @@ var (
 		}
 	}
 	// 默认查询记录
-	defaultPrimaryQueryFn = func(key string) func(ctx context.Context, db model.ModelTX, entity interface{}, val interface{}) error {
-		return func(ctx context.Context, db model.ModelTX, entity interface{}, val interface{}) error {
+	defaultPrimaryQueryFn = func(key string) func(ctx context.Context, db *model.Model, entity interface{}, val interface{}) error {
+		return func(ctx context.Context, db *model.Model, entity interface{}, val interface{}) error {
 			return db.Find(ctx, entity, map[string]interface{}{
 				key:      val,
 				"_limit": []uint{1},
@@ -39,7 +39,7 @@ var (
 		}
 	}
 	// 默认查询单条记录
-	defaultIndexQueryFn IndexQueryFn = func(ctx context.Context, db model.ModelTX, entity interface{}, key string, val interface{}) error {
+	defaultIndexQueryFn IndexQueryFn = func(ctx context.Context, db *model.Model, entity interface{}, key string, val interface{}) error {
 		return db.Find(ctx, entity, map[string]interface{}{
 			key:      val,
 			"_limit": []uint{1},
@@ -49,34 +49,28 @@ var (
 
 type (
 	CachedKeyFn    func(fieldName string, val interface{}) string
-	PrimaryQueryFn func(ctx context.Context, db model.ModelTX, entity interface{}, val interface{}) error
-	IndexQueryFn   func(ctx context.Context, db model.ModelTX, entity interface{}, key string, val interface{}) error
+	PrimaryQueryFn func(ctx context.Context, db *model.Model, entity interface{}, val interface{}) error
+	IndexQueryFn   func(ctx context.Context, db *model.Model, entity interface{}, key string, val interface{}) error
 
-	MODEL interface {
+	Entity interface {
 		GetID() int64 // mysql primary
 	}
 
 	CachedModelTX interface {
-		model.ModelTX
-		cache.Cache
 		// 通过主键查询，默认走缓存
-		FindByPrimaryKey(ctx context.Context, entity MODEL, val interface{}) error
+		FindByPrimaryKey(ctx context.Context, entity Entity, val interface{}) error
 		// 通过主键更新，默认删除缓存
 		UpdateByPrimaryKey(ctx context.Context, val interface{}, value map[string]interface{}) (res sql.Result, err error)
 		// 通过主键删除
 		DeleteByPrimaryKey(ctx context.Context, val interface{}) (res sql.Result, err error)
 		// 通过索引查询
-		FindByKey(ctx context.Context, entity MODEL, fieldName string, val interface{}) error
+		FindByKey(ctx context.Context, entity Entity, fieldName string, val interface{}) error
 	}
 
-	CachedModel interface {
-		CachedModelTX
-		TX(tx sqlx.Session) CachedModelTX
-	}
+	Model struct {
+		*model.Model
+		cache cache.Cache
 
-	cachedModelTX struct {
-		model.ModelTX
-		cache.Cache
 		// 对应的主键
 		primaryKey string
 		// 缓存键拼接方法
@@ -85,11 +79,6 @@ type (
 		primaryQueryFn PrimaryQueryFn
 		// 通过索引查询
 		indexQueryFn IndexQueryFn
-	}
-
-	cachedModel struct {
-		db model.Model
-		*cachedModelTX
 	}
 )
 
@@ -165,13 +154,10 @@ func NewCachedModel(db model.Model, c cache.CacheConf, opts ...CachedModelOption
 	}
 }
 
-func (c cachedModelTX) FindByPrimaryKey(ctx context.Context, entity MODEL, val interface{}) error {
-	if c.Cache != nil {
-		return c.Take(entity, c.cachedKeyFn(c.primaryKey, val), func(v interface{}) error {
-			return c.primaryQueryFn(ctx, c.ModelTX, entity, val)
-		})
-	}
-	return c.primaryQueryFn(ctx, c.ModelTX, entity, val)
+func (c Model) FindByPrimaryKey(ctx context.Context, entity Entity, val interface{}) error {
+	return c.cache.Take(entity, c.cachedKeyFn(c.primaryKey, val), func(v interface{}) error {
+		return c.primaryQueryFn(ctx, c.Model, entity, val)
+	})
 }
 
 func (c cachedModelTX) UpdateByPrimaryKey(ctx context.Context, val interface{}, value map[string]interface{}) (res sql.Result, err error) {
