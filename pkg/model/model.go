@@ -11,9 +11,11 @@ import (
 )
 
 func init() {
-	scanner.SetTagName("db")
+	scanner.SetTagName(ScannerTag)
 	scanner.ErrEmptyResult = sqlx.ErrNotFound
 }
+
+const ScannerTag = "db"
 
 var (
 	defaultPerPage uint = 15
@@ -25,9 +27,27 @@ type (
 		QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 	}
 
-	queryCall func(db session, table string) error
-	execCall  func(db session, table string) (res sql.Result, err error)
-	countCall func(db session, table string) (res int64, err error)
+	IModel interface {
+		Find(ctx context.Context, entity interface{}, conditions map[string]interface{}, fields ...string) error
+		Insert(ctx context.Context, data map[string]interface{}) (res sql.Result, err error)
+		Inserts(ctx context.Context, data ...map[string]interface{}) (res sql.Result, err error)
+		Count(ctx context.Context, conditions map[string]interface{}) (res int64, err error)
+		Delete(ctx context.Context, conditions map[string]interface{}) (res sql.Result, err error)
+		Update(ctx context.Context, val map[string]interface{}, conditions map[string]interface{}) (res sql.Result, err error)
+		Pagination(ctx context.Context, page int64, perPage uint, entity interface{}, conditions map[string]interface{}) (paginator *Paginator, err error)
+		Table() string
+	}
+
+	Model interface {
+		IModel
+		DB() *sql.DB
+		TX(tx *sql.Tx) ModelTx
+	}
+
+	ModelTx interface {
+		IModel
+		DB() *sql.Tx
+	}
 
 	core struct {
 		db      session
@@ -40,12 +60,12 @@ type (
 		*core
 	}
 
-	Model struct {
+	model struct {
 		db *sql.DB
 		*core
 	}
 
-	Option func(m *Model)
+	Option func(m *model)
 
 	Paginator struct {
 		Total       int64 `json:"total"`         // 总计条数
@@ -58,14 +78,14 @@ type (
 
 // 设置分页步长
 func SetPerPage(perPage uint) Option {
-	return func(m *Model) {
+	return func(m *model) {
 		m.perPage = perPage
 	}
 }
 
 // NewModel
-func New(db *sql.DB, table string, opts ...Option) *Model {
-	m := &Model{
+func New(db *sql.DB, table string, opts ...Option) Model {
+	m := &model{
 		db: db,
 		core: &core{
 			db:      db,
@@ -80,7 +100,7 @@ func New(db *sql.DB, table string, opts ...Option) *Model {
 }
 
 // 实例化事务对象
-func (m Model) TX(tx *sql.Tx) *modelTx {
+func (m model) TX(tx *sql.Tx) ModelTx {
 	return &modelTx{
 		db: tx,
 		core: &core{
@@ -92,7 +112,7 @@ func (m Model) TX(tx *sql.Tx) *modelTx {
 }
 
 // return database handle
-func (m Model) DB() *sql.DB {
+func (m model) DB() *sql.DB {
 	return m.db
 }
 
