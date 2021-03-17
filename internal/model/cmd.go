@@ -373,7 +373,9 @@ func (m modelGenerate) genMethodUpdate() {
 		m.methodsBuf.Out()
 
 		m.methodsBuf.P("}, map[string]interface{}{")
-		m.methodsBuf.P(m.table.Name.Source(), " : ", m.table.StructArgName(), ".", m.table.Name.ToCamel(), ",")
+		m.methodsBuf.In()
+		m.methodsBuf.P(m.table.PrimaryKey.Name.Source(), " : ", m.table.PrimaryKey.ArgName(), ",")
+		m.methodsBuf.Out()
 		m.methodsBuf.P("})")
 		m.methodsBuf.Out()
 		if m.table.PrimaryKey != nil {

@@ -14,5 +14,6 @@ func Test_fromDDl(t *testing.T) {
 	}
 
 	dir = path.Join(filepath.Dir(dir), "*.sql")
+	t.Logf("dir = %s\n",dir)
 	fromDDl(dir, "", true)
 }
