@@ -20,6 +20,11 @@ func Exec(cmd *cobra.Command, args []string) {
 
 }
 
+type modelCachedKeyMethod struct {
+	name   string
+	fields []Field
+}
+
 type modelGenerate struct {
 	table            Table
 	cache            bool
@@ -85,16 +90,15 @@ func (m modelGenerate) genModel() ([]byte, error) {
 
 	var modelBuf generate.Buf
 
-	m.gen.AddImport("work-task/pkg/model")
+	m.gen.AddImport("go-artisan/pkg/model")
 	modelBuf.In()
 	modelBuf.P(m.defaultModelName, " struct {")
 	modelBuf.In()
+	modelBuf.P("model model.Model")
 	if m.cache {
 		// import
-		m.gen.AddImport("work-task/pkg/sqlc")
-		modelBuf.P("*sqlc.Model")
-	} else {
-		modelBuf.P("*model.Model")
+		m.gen.AddImport("go-artisan/pkg/cache")
+		modelBuf.P("cache cache.Cache")
 	}
 	modelBuf.P("table string")
 	modelBuf.Out()
@@ -122,6 +126,7 @@ func (m modelGenerate) genModel() ([]byte, error) {
 		m.gen.P(")")
 	}
 	m.gen.P(m.methodsBuf.Bytes())
+	m.gen.P(m.genCachedKeys())
 	return m.gen.Frame()
 
 }
@@ -137,7 +142,7 @@ func (m modelGenerate) genMethods() {
 	m.interfaceBuf.P(m.table.StructName(), "Model interface {")
 	m.interfaceBuf.In()
 
-	// Insert(ctx context.Context, task *Task) (res *sql.Result, err error)
+	// Insert(ctx context.Context, task *Task) (res sql.Result, err error)
 	m.genMethodInsert()
 	// FindOne(ctx context.Context, intId int64) (*Model, error)
 	m.genMethodFindOne()
@@ -174,7 +179,7 @@ func (m modelGenerate) genModelStruct() []byte {
 
 func (m modelGenerate) genMethodInsert() {
 	funcName := "Insert"
-	funcSignature := fmt.Sprintf("%s(ctx context.Context, %s *%s) (res *sql.Result, err error)",
+	funcSignature := fmt.Sprintf("%s(ctx context.Context, %s *%s) (res sql.Result, err error)",
 		funcName,
 		m.table.StructArgName(),
 		m.table.StructName())
@@ -184,41 +189,27 @@ func (m modelGenerate) genMethodInsert() {
 
 	m.methodsBuf.P("func (m *", m.defaultModelName, ") ", funcSignature, " {")
 	m.methodsBuf.In()
+	m.methodsBuf.P("res, err = m.model.Insert(ctx, map[string]interface{}{")
+	m.methodsBuf.In()
+	for _, field := range m.table.Fields {
+		if field.IsPrimaryKey() {
+			continue
+		}
+		m.methodsBuf.P(strconv.Quote(field.Name.Source()), ":", m.table.StructArgName(), ".", field.Name.ToCamel(), ",")
+	}
+	m.methodsBuf.Out()
+	m.methodsBuf.P("})")
+
+	m.methodsBuf.P("if err != nil {")
+	m.methodsBuf.In()
+	m.methodsBuf.P("return nil, err")
+	m.methodsBuf.Out()
+	m.methodsBuf.P("}")
 	if m.cache {
-		m.methodsBuf.P("return m.Model.Exec(ctx, func(ctx context.Context, db model.IModel) (res sql.Result, err error) {")
-		m.methodsBuf.In()
-		m.methodsBuf.P("return db.Insert(ctx, map[string]interface{}{")
-
-		m.methodsBuf.In()
-		for _, field := range m.table.Fields {
-			if field.IsPrimaryKey() {
-				continue
-			}
-			m.methodsBuf.P(field.Name.Source(), ":", m.table.StructArgName(), ".", field.Name.ToCamel(), ",")
-		}
-		m.methodsBuf.Out()
-
-		m.methodsBuf.P("})")
-		m.methodsBuf.Out()
 		if m.table.PrimaryKey != nil {
-			m.methodsBuf.P("}, m.CachedPrimaryKey(", m.table.StructArgName(), ".", m.table.PrimaryKey.Name.ToCamel(), "))")
-		} else {
-			m.methodsBuf.P("})")
+			m.methodsBuf.P("id, _ := res.LastInsertId()")
+			m.methodsBuf.P("return m.cache.Del(ctx, m.primaryCachedKey(id))")
 		}
-
-	} else {
-		m.methodsBuf.P("return m.Model.Insert(ctx, map[string]interface{}{")
-
-		m.methodsBuf.In()
-		for _, field := range m.table.Fields {
-			if field.IsPrimaryKey() {
-				continue
-			}
-			m.methodsBuf.P(field.Name.Source(), ":", m.table.StructArgName(), ".", field.Name.ToCamel(), ",")
-		}
-		m.methodsBuf.Out()
-
-		m.methodsBuf.P("})")
 	}
 	m.methodsBuf.Out()
 	m.methodsBuf.P("}")
@@ -404,4 +395,47 @@ func (m modelGenerate) genMethodUpdate() {
 
 func (m modelGenerate) genMethodDelete() {
 
+}
+
+func (m modelGenerate) genCachedKeys() []byte {
+	m.gen.AddImport("fmt")
+	var buf generate.Buf
+	if m.table.PrimaryKey != nil {
+		buf.P("func (m ", m.defaultModelName, ") primaryCachedKey(", m.table.PrimaryKey.ArgName(), " interface{}) string {")
+		buf.In()
+		buf.P("return fmt.Sprintf(\"cached#%s#", m.table.PrimaryKey.ArgName(), "#%v\", m.table,", m.table.PrimaryKey.ArgName(), ")")
+		buf.Out()
+		buf.P("}")
+	}
+
+	for _, fields := range m.table.UniqueIndex {
+		var (
+			funcName bytes.Buffer
+			args     bytes.Buffer
+			ss       bytes.Buffer
+		)
+		for index, field := range fields {
+			funcName.WriteString(field.Name.ToCamel())
+			ss.WriteString(field.ArgName())
+			ss.WriteString("#")
+			args.WriteString(field.ArgName())
+			args.WriteString(" ")
+			args.WriteString(field.DataType)
+			if index < len(fields)-1 {
+				funcName.WriteString("And")
+				args.WriteByte(',')
+			}
+		}
+		funcName.WriteString("CachedKey")
+
+		buf.P("func (m ", m.defaultModelName, ")", funcName.String(), "(", args.String(), ") string {")
+		buf.In()
+
+		buf.P("return fmt.Sprintf(\"cached#%s#", ss.String(), "#%v\", m.table,", m.table.PrimaryKey.ArgName(), ")")
+		buf.Out()
+		buf.P("}")
+
+	}
+
+	return buf.Bytes()
 }

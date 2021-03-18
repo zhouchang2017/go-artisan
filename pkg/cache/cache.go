@@ -2,60 +2,169 @@ package cache
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
+	"time"
+
 	"github.com/go-redis/redis/v8"
-	"github.com/patrickmn/go-cache"
+	jsoniter "github.com/json-iterator/go"
 	"golang.org/x/sync/singleflight"
-	"reflect"
+)
+
+const notFoundPlaceholder = "*"
+
+// indicates there is no such value associate with the key
+var (
+	errPlaceholder = errors.New("placeholder")
+	json           = jsoniter.ConfigCompatibleWithStandardLibrary
+
+	defaultExpiration         = time.Minute * 60
+	defaultNotFoundExpiration = time.Minute * 2
 )
 
 type (
+	cmd interface {
+		Get(ctx context.Context, key string, val interface{}) error
+		Set(ctx context.Context, key string, val interface{}, d time.Duration) error
+		Del(ctx context.Context, key ...string) error
+	}
+
+	Cache interface {
+		Take(ctx context.Context, key string, val interface{}, query func(context.Context, interface{}) error) error
+		Get(ctx context.Context, key string, val interface{}) error
+		Set(ctx context.Context, key string, val interface{}) error
+		Del(ctx context.Context, key ...string) error
+	}
+
 	store struct {
-		client redis.Cmdable
-		local  *cache.Cache
-		g      singleflight.Group
+		cmds               []cmd
+		g                  singleflight.Group
+		errNotFound        error
+		expiration         time.Duration
+		notFoundExpiration time.Duration
 	}
 )
 
-func (c *store) getFromLocal(entity interface{}, key string) bool {
-	if c.local != nil {
-		if value, ok := c.local.Get(key); ok {
-			setInterfaceValue(entity, value)
-			return true
-		}
-	}
-	return false
+type Option struct {
+	Redis              redis.Cmdable
+	Local              bool
+	Expiration         time.Duration
+	NotFoundExpiration time.Duration
 }
 
-func (c *store) Take(ctx context.Context, entity interface{}, key string) error {
-	_, err, _ := c.g.Do(key, func() (i interface{}, err error) {
-		if ok := c.getFromLocal(entity, key); ok {
-			return nil, nil
-		}
-		bytes, err := c.client.Get(ctx, key).Bytes()
-		if err != nil {
+func New(opt Option, errNotFound error) Cache {
+	var cmds []cmd
+	if opt.Local {
+		cmds = append(cmds, newLocalStore(5*time.Minute, 10*time.Minute, errNotFound))
+	}
+	if opt.Redis != nil {
+		cmds = append(cmds, newRedisStore(opt.Redis, errNotFound))
+	}
+	if len(cmds) == 0 {
+		cmds = append(cmds, newLocalStore(5*time.Minute, 10*time.Minute, errNotFound))
+	}
+	s := &store{
+		cmds:               cmds,
+		errNotFound:        errNotFound,
+		expiration:         defaultExpiration,
+		notFoundExpiration: defaultNotFoundExpiration,
+	}
+	if opt.Expiration > 0 {
+		s.expiration = opt.Expiration
+	}
+	if opt.NotFoundExpiration > 0 {
+		s.notFoundExpiration = opt.NotFoundExpiration
+	}
+	return s
+}
 
-			return nil, err
-		}
-		if err := json.Unmarshal(bytes, entity); err != nil {
-			return nil, err
+func (c *store) Take(ctx context.Context, key string, val interface{}, query func(context.Context, interface{}) error) error {
+	_, err, _ := c.g.Do(key, func() (interface{}, error) {
+		if err := c.doGetCache(ctx, key, val); err != nil {
+			switch err {
+			case errPlaceholder:
+				return nil, c.errNotFound
+			case c.errNotFound:
+
+				err := query(ctx, val)
+
+				if err != nil {
+					if err == c.errNotFound {
+						if err2 := c.setCacheWithNotFound(ctx, key); err2 != nil {
+							// set cache err
+							return nil, err2
+						}
+						return nil, err
+					}
+					// db query err
+					return nil, err
+				}
+				// rewrite cache
+				if err := c.setCache(ctx, key, val); err != nil {
+					return nil, err
+				}
+			default:
+				return nil, err
+			}
 		}
 		return nil, nil
 	})
+	return err
 }
 
-func setInterfaceValue(dst, src interface{}) {
-	rx := reflect.ValueOf(dst)
-	if rx.Kind() != reflect.Ptr {
-		panic("dst type must be ptr")
-	}
-	if !rx.CanSet() {
-		rx = rx.Elem()
-	}
-	s := reflect.ValueOf(src)
-	if s.Kind() != rx.Kind() {
-		s = s.Elem()
-	}
+func (c *store) Get(ctx context.Context, key string, val interface{}) error {
+	return c.doGetCache(ctx, key, val)
+}
 
-	rx.Set(s)
+func (c *store) Set(ctx context.Context, key string, val interface{}) error {
+	for _, item := range c.cmds {
+		if err := item.Set(ctx, key, val, c.expiration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *store) Del(ctx context.Context, key ...string) error {
+	for _, item := range c.cmds {
+		if err := item.Del(ctx, key...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *store) doGetCache(ctx context.Context, key string, val interface{}) (err error) {
+	for _, item := range c.cmds {
+		err = item.Get(ctx, key, val)
+		if err != nil {
+			switch err {
+			case c.errNotFound:
+
+			case errPlaceholder:
+
+			}
+			return err
+
+		}
+		return nil
+	}
+	return c.errNotFound
+}
+
+func (c *store) setCache(ctx context.Context, key string, val interface{}) error {
+	for _, item := range c.cmds {
+		if err := item.Set(ctx, key, val, c.expiration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *store) setCacheWithNotFound(ctx context.Context, key string) error {
+	for _, item := range c.cmds {
+		if err := item.Set(ctx, key, notFoundPlaceholder, c.notFoundExpiration); err != nil {
+			return err
+		}
+	}
+	return nil
 }
