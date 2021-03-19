@@ -12,7 +12,7 @@ import (
 type (
 	TaskModel interface {
 		// Insert 插入新纪录
-		Insert(ctx context.Context, task *Task) (res *sql.Result, err error)
+		Insert(ctx context.Context, task *Task) (res sql.Result, err error)
 		// FindOne 通过主键查询Task
 		FindOne(ctx context.Context, intId int64) (task *Task, err error)
 		// FindOneByTaskId 通过key查询Task

@@ -1,9 +1,12 @@
 package model
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"go/token"
 	"strings"
+	"text/template"
 
 	"github.com/tal-tech/go-zero/core/collection"
 	"github.com/tal-tech/go-zero/tools/goctl/util/console"
@@ -67,7 +70,7 @@ type (
 
 	// Primary describes a primary key
 	Primary struct {
-		Field
+		*Field
 		AutoIncrement bool
 	}
 
@@ -105,6 +108,9 @@ func (t *Table) StructName() string {
 func (t *Table) StructArgName() string {
 	if t.structArgName == "" {
 		t.structArgName = stringx.From(t.StructName()).Untitle()
+		if token.IsKeyword(t.structArgName) {
+			t.structArgName = t.structArgName + "1"
+		}
 	}
 	return t.structArgName
 }
@@ -113,12 +119,39 @@ func (t *Table) StructArgName() string {
 func (f *Field) ArgName() string {
 	if f.argName == "" {
 		f.argName = stringx.From(f.Name.ToCamel()).Untitle()
+		if token.IsKeyword(f.argName) {
+			f.argName = f.argName + "1"
+		}
 	}
 	return f.argName
 }
 
 func (f *Field) IsPrimaryKey() bool {
 	return f.isPrimaryKey
+}
+
+func (f Field) GetKeyerFuncName() string {
+	return fmt.Sprintf("%sCachedKey", f.ArgName())
+}
+
+var keyerFuncTemplate, _ = template.New("keyerFunc").Parse(`// {{.funcName}} get {{.arg}} cached key.
+func (m {{.structName}}) {{.funcName}} ({{.arg}} {{.argType}}) string {
+	return fmt.Sprintf("cached#%s#{{.fieldName}}#%v", m.table, {{.arg}})
+}`)
+
+func (f *Field) KeyerFuncTemplate(structName string) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	err := keyerFuncTemplate.Execute(buf, map[string]interface{}{
+		"structName": structName,
+		"funcName":   f.GetKeyerFuncName(),
+		"arg":        f.ArgName(),
+		"argType":    f.DataType,
+		"fieldName":  f.Name.Source(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // ConvertDataType converts mysql column type into golang type
@@ -275,7 +308,7 @@ func convertColumns(columns []*sqlparser.ColumnDefinition, primaryColumn string)
 		if field.Name.Source() == primaryColumn {
 			field.isPrimaryKey = true
 			primaryKey = Primary{
-				Field:         field,
+				Field:         &field,
 				AutoIncrement: bool(column.Type.Autoincrement),
 			}
 		}

@@ -16,23 +16,32 @@ import (
 
 var errNotMatched = errors.New("sql not matched")
 
+const (
+	RootPkgPath  = "github.com/zhouchang2017/"
+	CachePkgPath = RootPkgPath + "go-artisan/pkg/cache"
+	ModelPkgPath = RootPkgPath + "go-artisan/pkg/model"
+
+	modelKeyField = "keyField"
+)
+
 func Exec(cmd *cobra.Command, args []string) {
 
-}
-
-type modelCachedKeyMethod struct {
-	name   string
-	fields []Field
 }
 
 type modelGenerate struct {
 	table            Table
 	cache            bool
+	keyField         *Field // 缓存主键，如果改表格没有主键，则启用第一个唯一键（非联合）,r如果这个字段为nil则无法开启缓存
+	uniqueFields     []*Field
 	gen              *generate.Writer
 	typesBuf         *generate.Buf
 	interfaceBuf     *generate.Buf
 	methodsBuf       *generate.Buf
 	defaultModelName string
+}
+
+func (m modelGenerate) cacheable() bool {
+	return m.cache && m.keyField != nil
 }
 
 func fromDDl(src, dir string, cache bool) error {
@@ -64,15 +73,27 @@ func fromDDl(src, dir string, cache bool) error {
 			return err
 		}
 
+		keyField := table.PrimaryKey.Field
+		var uniqueFields []*Field
+		for _, fields := range table.UniqueIndex {
+			if keyField == nil && len(fields) == 1 {
+				keyField = fields[0]
+			}
+			uniqueFields = append(uniqueFields, fields[0])
+		}
+
 		gen := modelGenerate{
 			table:            *table,
 			cache:            cache,
+			keyField:         keyField,
+			uniqueFields:     uniqueFields,
 			gen:              generator.NewWriter(),
 			typesBuf:         &generate.Buf{},
 			interfaceBuf:     &generate.Buf{},
 			methodsBuf:       &generate.Buf{},
 			defaultModelName: "default" + table.StructName(),
 		}
+
 		model, err := gen.genModel()
 		if err != nil {
 			panic(err)
@@ -95,10 +116,11 @@ func (m modelGenerate) genModel() ([]byte, error) {
 	modelBuf.P(m.defaultModelName, " struct {")
 	modelBuf.In()
 	modelBuf.P("model model.Model")
-	if m.cache {
+	if m.cacheable() {
 		// import
 		m.gen.AddImport("go-artisan/pkg/cache")
 		modelBuf.P("cache cache.Cache")
+		modelBuf.P(modelKeyField, " string")
 	}
 	modelBuf.P("table string")
 	modelBuf.Out()
@@ -205,64 +227,38 @@ func (m modelGenerate) genMethodInsert() {
 	m.methodsBuf.P("return nil, err")
 	m.methodsBuf.Out()
 	m.methodsBuf.P("}")
-	if m.cache {
-		if m.table.PrimaryKey != nil {
-			m.methodsBuf.P("id, _ := res.LastInsertId()")
-			m.methodsBuf.P("return m.cache.Del(ctx, m.primaryCachedKey(id))")
+	if m.cacheable() && len(m.uniqueFields) > 0 {
+		m.methodsBuf.P("keys := []string{")
+		m.methodsBuf.In()
+		for _, field := range m.uniqueFields {
+			if field.Name.Source() != m.keyField.Name.Source() {
+				m.methodsBuf.P("m.", field.GetKeyerFuncName(), "(", m.table.StructArgName(), ".", field.ArgName(), "),")
+			}
 		}
+		m.methodsBuf.Out()
+		m.methodsBuf.P("}")
+
+		m.methodsBuf.P("return res, m.cache.Del(ctx, keys...)")
+	} else {
+		m.methodsBuf.P("return res, err")
 	}
 	m.methodsBuf.Out()
 	m.methodsBuf.P("}")
 }
 
 func (m modelGenerate) genMethodFindOne() {
-	funcName := "FindOne"
-	if m.table.PrimaryKey != nil {
-		funcSignature := fmt.Sprintf("%s(ctx context.Context, %s %s) (%s *%s, err error)",
-			funcName,
-			m.table.PrimaryKey.ArgName(),
-			m.table.PrimaryKey.DataType,
-			m.table.StructArgName(),
-			m.table.StructName())
-
-		m.interfaceBuf.P("// ", funcName, " 通过主键查询", m.table.StructName())
-		m.interfaceBuf.P(funcSignature)
-
-		m.methodsBuf.P("func (m *", m.defaultModelName, ") ", funcSignature, " {")
-		m.methodsBuf.In()
-
-		m.methodsBuf.P("var resp ", m.table.StructName())
-		if m.cache {
-			m.methodsBuf.P("err := m.Model.FindByPrimaryKey(ctx, &resp, ", m.table.PrimaryKey.ArgName(), ")")
-		} else {
-			m.methodsBuf.P("err:= m.Model.Find(ctx, &resp, map[string]interface{}{")
-			m.methodsBuf.In()
-			m.methodsBuf.P(m.table.PrimaryKey.Name.Source(), " : ", m.table.PrimaryKey.ArgName(), ",")
-			m.methodsBuf.P("_limit : []uint{0},")
-			m.methodsBuf.Out()
-			m.methodsBuf.P("})")
+	if m.keyField != nil {
+		bytes, err := m.getFindOneSignature()
+		if err != nil {
+			panic(err)
 		}
-		m.methodsBuf.P("switch err {")
+		m.interfaceBuf.P(bytes)
 
-		m.methodsBuf.P("case nil:")
-		m.methodsBuf.In()
-		m.methodsBuf.P("return &resp, nil")
-		m.methodsBuf.Out()
-
-		m.methodsBuf.P("sqlc.ErrNotFound:")
-		m.methodsBuf.In()
-		m.methodsBuf.P("return nil, ErrNotFound")
-		m.methodsBuf.Out()
-
-		m.methodsBuf.P("default:")
-		m.methodsBuf.In()
-		m.methodsBuf.P("return nil, err")
-		m.methodsBuf.Out()
-
-		m.methodsBuf.P("}")
-
-		m.methodsBuf.Out()
-		m.methodsBuf.P("}")
+		bytes, err = m.getFindOne()
+		if err != nil {
+			panic(err)
+		}
+		m.methodsBuf.P(bytes)
 	}
 }
 
@@ -297,7 +293,7 @@ func (m modelGenerate) genMethodFindOneByKeys(fields []*Field) {
 
 	m.methodsBuf.P("var resp ", m.table.StructName())
 	if m.cache {
-		m.methodsBuf.P("err := m.Model.FindByKey(ctx, &resp, map[string]interface{}{")
+		m.methodsBuf.P("err := m.Model.Find(ctx, &resp, map[string]interface{}{")
 		m.methodsBuf.In()
 		for _, field := range fields {
 			m.methodsBuf.P(field.Name.Source(), " : ", field.ArgName(), ",")
@@ -401,40 +397,18 @@ func (m modelGenerate) genCachedKeys() []byte {
 	m.gen.AddImport("fmt")
 	var buf generate.Buf
 	if m.table.PrimaryKey != nil {
-		buf.P("func (m ", m.defaultModelName, ") primaryCachedKey(", m.table.PrimaryKey.ArgName(), " interface{}) string {")
-		buf.In()
-		buf.P("return fmt.Sprintf(\"cached#%s#", m.table.PrimaryKey.ArgName(), "#%v\", m.table,", m.table.PrimaryKey.ArgName(), ")")
-		buf.Out()
-		buf.P("}")
-	}
-
-	for _, fields := range m.table.UniqueIndex {
-		var (
-			funcName bytes.Buffer
-			args     bytes.Buffer
-			ss       bytes.Buffer
-		)
-		for index, field := range fields {
-			funcName.WriteString(field.Name.ToCamel())
-			ss.WriteString(field.ArgName())
-			ss.WriteString("#")
-			args.WriteString(field.ArgName())
-			args.WriteString(" ")
-			args.WriteString(field.DataType)
-			if index < len(fields)-1 {
-				funcName.WriteString("And")
-				args.WriteByte(',')
-			}
+		data, err := m.table.PrimaryKey.KeyerFuncTemplate(m.defaultModelName)
+		if err == nil {
+			buf.P(data)
+			buf.P()
 		}
-		funcName.WriteString("CachedKey")
-
-		buf.P("func (m ", m.defaultModelName, ")", funcName.String(), "(", args.String(), ") string {")
-		buf.In()
-
-		buf.P("return fmt.Sprintf(\"cached#%s#", ss.String(), "#%v\", m.table,", m.table.PrimaryKey.ArgName(), ")")
-		buf.Out()
-		buf.P("}")
-
+	}
+	for _, fields := range m.uniqueFields {
+		data, err := fields.KeyerFuncTemplate(m.defaultModelName)
+		if err == nil {
+			buf.P(data)
+			buf.P()
+		}
 	}
 
 	return buf.Bytes()
