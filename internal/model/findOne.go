@@ -33,7 +33,6 @@ var findOneTemplate, _ = template.New("findOne").Parse(`func (m *{{.structName}}
 		"_limit": []uint{1},
 	})
 	{{end}}
-
 	switch err {
 	case nil:
 		return &resp, nil
