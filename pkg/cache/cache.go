@@ -42,10 +42,10 @@ type (
 	Option func(s *store)
 
 	store struct {
-		name string
-		mdb  *cache.Cache  // 一级缓存
-		rdb  redis.Cmdable // 二级缓存
-
+		name               string
+		mdb                *cache.Cache  // 一级缓存
+		rdb                redis.Cmdable // 二级缓存
+		enableMdb          bool          // default true
 		g                  singleflight.Group
 		errNotFound        error
 		expiration         time.Duration
@@ -53,20 +53,30 @@ type (
 	}
 )
 
+// 设置缓存时间
 func SetExpiration(d time.Duration) Option {
 	return func(s *store) {
 		s.expiration = d
 	}
 }
 
+// 设置NotFound缓存时间
 func SetNotFoundExpiration(d time.Duration) Option {
 	return func(s *store) {
 		s.notFoundExpiration = d
 	}
 }
 
+// 禁用本地缓存
+func DisableLocalCache() Option {
+	return func(s *store) {
+		s.enableMdb = false
+	}
+}
+
 func New(client redis.Cmdable, errNotFound error, opts ...Option) Cache {
 	s := &store{
+		enableMdb:          true,
 		errNotFound:        errNotFound,
 		expiration:         defaultExpiration,
 		notFoundExpiration: defaultNotFoundExpiration,
@@ -125,36 +135,28 @@ func (c *store) Set(ctx context.Context, key string, val interface{}) error {
 }
 
 func (c *store) Del(ctx context.Context, key ...string) error {
-	for _, k := range key {
-		c.mdb.Delete(k)
-	}
+	c.deleteLocalCache(key...)
 	if c.rdb != nil {
 		return c.rdb.Del(ctx, key...).Err()
 	}
 	return nil
 }
 
-func (c *store) DeleteLocalCache(key ...string) {
-	for _, k := range key {
-		c.mdb.Delete(k)
+func (c *store) deleteLocalCache(key ...string) {
+	if c.enableMdb {
+		for _, k := range key {
+			c.mdb.Delete(k)
+		}
 	}
 }
 
 func (c *store) doGetCache(ctx context.Context, key string, val interface{}) (err error) {
-	handlerRes := func(storeType int, data []byte) error {
-		if bytes.Equal(data, notFoundPlaceholder) {
-			return errPlaceholder
-		}
-		if bytes.Equal(data, []byte("")) {
-			return c.errNotFound
-		}
-		return c.processCache(ctx, storeType, key, data, val)
-	}
-
-	value, exist := c.mdb.Get(key)
-	if exist {
-		if v, ok := value.([]byte); ok {
-			return handlerRes(localStore, v)
+	if c.enableMdb {
+		value, exist := c.mdb.Get(key)
+		if exist {
+			if v, ok := value.([]byte); ok {
+				return c.processCache(ctx, localStore, key, v, val)
+			}
 		}
 	}
 
@@ -166,7 +168,7 @@ func (c *store) doGetCache(ctx context.Context, key string, val interface{}) (er
 			}
 			return err
 		}
-		return handlerRes(redisStore, data)
+		return c.processCache(ctx, redisStore, key, data, val)
 	}
 
 	return c.errNotFound
@@ -177,7 +179,11 @@ func (c *store) setCache(ctx context.Context, key string, val interface{}) error
 	if err != nil {
 		return err
 	}
-	c.mdb.Set(key, marshal, c.expiration)
+
+	if c.enableMdb {
+		c.mdb.Set(key, marshal, c.expiration)
+	}
+
 	if c.rdb != nil {
 		return c.rdb.Set(ctx, key, marshal, c.expiration).Err()
 	}
@@ -185,11 +191,21 @@ func (c *store) setCache(ctx context.Context, key string, val interface{}) error
 }
 
 func (c *store) processCache(ctx context.Context, storeType int, key string, data []byte, v interface{}) error {
+	if bytes.Equal(data, notFoundPlaceholder) {
+		return errPlaceholder
+	}
+	if bytes.Equal(data, []byte("")) {
+		return c.errNotFound
+	}
+
 	err := json.Unmarshal(data, v)
 	if err == nil {
 		if storeType == redisStore {
 			// local store not hit!
-			c.mdb.Set(key, data, c.expiration)
+			if c.enableMdb {
+				c.mdb.Set(key, data, c.expiration)
+			}
+
 			logx.Infof("hit cache from redis [%s]", key)
 		} else {
 			logx.Infof("hit cache from local [%s]", key)
@@ -210,7 +226,10 @@ func (c *store) processCache(ctx context.Context, storeType int, key string, dat
 }
 
 func (c *store) setCacheWithNotFound(ctx context.Context, key string) error {
-	c.mdb.Set(key, notFoundPlaceholder, c.notFoundExpiration)
+	if c.enableMdb {
+		c.mdb.Set(key, notFoundPlaceholder, c.notFoundExpiration)
+	}
+
 	if c.rdb != nil {
 		return c.rdb.Set(ctx, key, notFoundPlaceholder, c.notFoundExpiration).Err()
 	}

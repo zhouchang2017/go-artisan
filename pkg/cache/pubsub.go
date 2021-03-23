@@ -44,7 +44,7 @@ func SyncLocalCache(ctx context.Context, rdb *redis.Client) {
 					continue
 				}
 				if store, ok := stores[req.Table]; ok {
-					store.DeleteLocalCache(req.Keys...)
+					store.deleteLocalCache(req.Keys...)
 				}
 			}
 		}
@@ -53,6 +53,6 @@ func SyncLocalCache(ctx context.Context, rdb *redis.Client) {
 
 func publishDeleteLocalCache() {
 	if pubDb != nil {
-		pubDb.Publish()
+		//pubDb.Publish()
 	}
 }
