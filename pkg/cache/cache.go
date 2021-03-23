@@ -1,33 +1,37 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/go-redis/redis/v8"
 	jsoniter "github.com/json-iterator/go"
+	"github.com/patrickmn/go-cache"
+	"github.com/tal-tech/go-zero/core/logx"
 	"golang.org/x/sync/singleflight"
 )
 
-const notFoundPlaceholder = "*"
+const (
+	localStore = iota
+	redisStore
+)
 
 // indicates there is no such value associate with the key
 var (
-	errPlaceholder = errors.New("placeholder")
-	json           = jsoniter.ConfigCompatibleWithStandardLibrary
+	notFoundPlaceholder = []byte("*")
+	errPlaceholder      = errors.New("placeholder")
+	json                = jsoniter.ConfigCompatibleWithStandardLibrary
 
 	defaultExpiration         = time.Minute * 60
 	defaultNotFoundExpiration = time.Minute * 2
+
+	stores = make(map[string]*store)
 )
 
 type (
-	cmd interface {
-		Get(ctx context.Context, key string, val interface{}) error
-		Set(ctx context.Context, key string, val interface{}, d time.Duration) error
-		Del(ctx context.Context, key ...string) error
-	}
-
 	Cache interface {
 		Take(ctx context.Context, key string, val interface{}, query func(context.Context, interface{}) error) error
 		Get(ctx context.Context, key string, val interface{}) error
@@ -35,8 +39,13 @@ type (
 		Del(ctx context.Context, key ...string) error
 	}
 
+	Option func(s *store)
+
 	store struct {
-		cmds               []cmd
+		name string
+		mdb  *cache.Cache  // 一级缓存
+		rdb  redis.Cmdable // 二级缓存
+
 		g                  singleflight.Group
 		errNotFound        error
 		expiration         time.Duration
@@ -44,35 +53,31 @@ type (
 	}
 )
 
-type Option struct {
-	Redis              redis.Cmdable
-	Local              bool
-	Expiration         time.Duration
-	NotFoundExpiration time.Duration
+func SetExpiration(d time.Duration) Option {
+	return func(s *store) {
+		s.expiration = d
+	}
 }
 
-func New(opt Option, errNotFound error) Cache {
-	var cmds []cmd
-	if opt.Local {
-		cmds = append(cmds, newLocalStore(5*time.Minute, 10*time.Minute, errNotFound))
+func SetNotFoundExpiration(d time.Duration) Option {
+	return func(s *store) {
+		s.notFoundExpiration = d
 	}
-	if opt.Redis != nil {
-		cmds = append(cmds, newRedisStore(opt.Redis, errNotFound))
-	}
-	if len(cmds) == 0 {
-		cmds = append(cmds, newLocalStore(5*time.Minute, 10*time.Minute, errNotFound))
-	}
+}
+
+func New(client redis.Cmdable, errNotFound error, opts ...Option) Cache {
 	s := &store{
-		cmds:               cmds,
 		errNotFound:        errNotFound,
 		expiration:         defaultExpiration,
 		notFoundExpiration: defaultNotFoundExpiration,
 	}
-	if opt.Expiration > 0 {
-		s.expiration = opt.Expiration
+	for _, opt := range opts {
+		opt(s)
 	}
-	if opt.NotFoundExpiration > 0 {
-		s.notFoundExpiration = opt.NotFoundExpiration
+
+	s.mdb = cache.New(s.expiration, s.expiration*2)
+	if client != nil {
+		s.rdb = client
 	}
 	return s
 }
@@ -116,55 +121,98 @@ func (c *store) Get(ctx context.Context, key string, val interface{}) error {
 }
 
 func (c *store) Set(ctx context.Context, key string, val interface{}) error {
-	for _, item := range c.cmds {
-		if err := item.Set(ctx, key, val, c.expiration); err != nil {
-			return err
-		}
-	}
-	return nil
+	return c.setCache(ctx, key, val)
 }
 
 func (c *store) Del(ctx context.Context, key ...string) error {
-	for _, item := range c.cmds {
-		if err := item.Del(ctx, key...); err != nil {
-			return err
-		}
+	for _, k := range key {
+		c.mdb.Delete(k)
+	}
+	if c.rdb != nil {
+		return c.rdb.Del(ctx, key...).Err()
 	}
 	return nil
 }
 
+func (c *store) DeleteLocalCache(key ...string) {
+	for _, k := range key {
+		c.mdb.Delete(k)
+	}
+}
+
 func (c *store) doGetCache(ctx context.Context, key string, val interface{}) (err error) {
-	for _, item := range c.cmds {
-		err = item.Get(ctx, key, val)
+	handlerRes := func(storeType int, data []byte) error {
+		if bytes.Equal(data, notFoundPlaceholder) {
+			return errPlaceholder
+		}
+		if bytes.Equal(data, []byte("")) {
+			return c.errNotFound
+		}
+		return c.processCache(ctx, storeType, key, data, val)
+	}
+
+	value, exist := c.mdb.Get(key)
+	if exist {
+		if v, ok := value.([]byte); ok {
+			return handlerRes(localStore, v)
+		}
+	}
+
+	if c.rdb != nil {
+		data, err := c.rdb.Get(ctx, key).Bytes()
 		if err != nil {
-			switch err {
-			case c.errNotFound:
-
-			case errPlaceholder:
-
+			if err == redis.Nil {
+				return c.errNotFound
 			}
 			return err
-
 		}
-		return nil
+		return handlerRes(redisStore, data)
 	}
+
 	return c.errNotFound
 }
 
 func (c *store) setCache(ctx context.Context, key string, val interface{}) error {
-	for _, item := range c.cmds {
-		if err := item.Set(ctx, key, val, c.expiration); err != nil {
-			return err
-		}
+	marshal, err := json.Marshal(val)
+	if err != nil {
+		return err
+	}
+	c.mdb.Set(key, marshal, c.expiration)
+	if c.rdb != nil {
+		return c.rdb.Set(ctx, key, marshal, c.expiration).Err()
 	}
 	return nil
 }
 
-func (c *store) setCacheWithNotFound(ctx context.Context, key string) error {
-	for _, item := range c.cmds {
-		if err := item.Set(ctx, key, notFoundPlaceholder, c.notFoundExpiration); err != nil {
-			return err
+func (c *store) processCache(ctx context.Context, storeType int, key string, data []byte, v interface{}) error {
+	err := json.Unmarshal(data, v)
+	if err == nil {
+		if storeType == redisStore {
+			// local store not hit!
+			c.mdb.Set(key, data, c.expiration)
+			logx.Infof("hit cache from redis [%s]", key)
+		} else {
+			logx.Infof("hit cache from local [%s]", key)
 		}
+		return nil
+	}
+
+	report := fmt.Sprintf("unmarshal cache, key: %s, value: %s, error: %v", key, data, err)
+	logx.Error(report)
+	//stat.Report(report)
+
+	if e := c.Del(ctx, key); e != nil {
+		logx.Errorf("delete invalid cache, key: %s, value: %s, error: %v", key, data, e)
+	}
+
+	// returns errNotFound to reload the value by the given queryFn
+	return c.errNotFound
+}
+
+func (c *store) setCacheWithNotFound(ctx context.Context, key string) error {
+	c.mdb.Set(key, notFoundPlaceholder, c.notFoundExpiration)
+	if c.rdb != nil {
+		return c.rdb.Set(ctx, key, notFoundPlaceholder, c.notFoundExpiration).Err()
 	}
 	return nil
 }
