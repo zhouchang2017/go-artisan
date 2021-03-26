@@ -7,20 +7,25 @@ import (
 
 type conn struct {
 	driver.Conn
-	hooks
+	*hook
 }
 
 func (c conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-
-	if queryerContext, ok := c.Conn.(driver.QueryerContext); ok {
-		rows, err := queryerContext.QueryContext(ctx, query, args)
-		return rows, err
+	handler := func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		if queryerContext, ok := c.Conn.(driver.QueryerContext); ok {
+			rows, err := queryerContext.QueryContext(ctx, query, args)
+			return rows, err
+		}
+		values, err := namedValueToValue(args)
+		if err != nil {
+			return nil, err
+		}
+		return c.Query(query, values)
 	}
-	values, err := namedValueToValue(args)
-	if err != nil {
-		return nil, err
+	if len(args) == 0 && c.hook != nil && c.hook.onQueryerHook != nil {
+		return c.hook.onQueryerHook(handler)(ctx, query, args)
 	}
-	return c.Query(query, values)
+	return handler(ctx, query, args)
 }
 
 func (c conn) Query(query string, args []driver.Value) (driver.Rows, error) {
@@ -31,15 +36,21 @@ func (c conn) Query(query string, args []driver.Value) (driver.Rows, error) {
 }
 
 func (c conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	if execerContext, ok := c.Conn.(driver.ExecerContext); ok {
-		r, err := execerContext.ExecContext(ctx, query, args)
-		return r, err
+	handler := func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+		if execerContext, ok := c.Conn.(driver.ExecerContext); ok {
+			r, err := execerContext.ExecContext(ctx, query, args)
+			return r, err
+		}
+		values, err := namedValueToValue(args)
+		if err != nil {
+			return nil, err
+		}
+		return c.Exec(query, values)
 	}
-	values, err := namedValueToValue(args)
-	if err != nil {
-		return nil, err
+	if len(args) == 0 && c.hook != nil && c.hook.onExecerHook != nil {
+		return c.hook.onExecerHook(handler)(ctx, query, args)
 	}
-	return c.Exec(query, values)
+	return handler(ctx, query, args)
 }
 
 func (c conn) Exec(query string, args []driver.Value) (driver.Result, error) {
@@ -55,7 +66,7 @@ func (c conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, er
 		if err != nil {
 			return nil, err
 		}
-		return &stmt{Stmt: s, hooks: c.hooks}, nil
+		return &stmt{Stmt: s, query: query, hook: c.hook}, nil
 	}
 	return c.Conn.Prepare(query)
 }
@@ -76,7 +87,7 @@ func (c conn) Prepare(query string) (driver.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &stmt{Stmt: s, hooks: c.hooks}, nil
+	return &stmt{Stmt: s, query: query, hook: c.hook}, nil
 }
 
 func (c conn) Begin() (driver.Tx, error) {

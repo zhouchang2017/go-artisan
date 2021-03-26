@@ -45,6 +45,36 @@ var findOneByKeyTemplate, _ = template.New("findOneByKey").Parse(`func (m *{{.st
 	}
 }`)
 
+/*
+func (s service) FindOneByKey(ctx context.Context, keyField string) (res *Project, err error) {
+	res = &Project{}
+	var primaryKey int64
+	var found bool
+	key := fmt.Sprintf("project#key#%v", keyField)
+
+	err = s.store.Take(ctx, key, &primaryKey, func(ctx context.Context, i interface{}) error {
+		rows, err := s.db.QueryContext(ctx, "select * from t_project where project_key = ? limit 1", keyField)
+		if err != nil {
+			return err
+		}
+		if err := scanner.ScanClose(rows, res); err != nil {
+			return err
+		}
+		primaryKey = res.ID
+		found = true
+
+		return s.store.Set(ctx, fmt.Sprintf("project#id#%d", res.ID), res)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		return res, nil
+	}
+
+	return s.FindOne(ctx, primaryKey)
+}
+*/
 func (m modelGenerate) getFindOneByKey() ([]byte, error) {
 	var buf bytes.Buffer
 	err := findOneByKeyTemplate.Execute(&buf, map[string]interface{}{
